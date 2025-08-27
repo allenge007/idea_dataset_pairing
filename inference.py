@@ -1,4 +1,4 @@
-# inference.py
+# inference.py (已修改，增加了命令行参数控制)
 
 import faiss
 import torch
@@ -6,37 +6,43 @@ import numpy as np
 import pandas as pd
 import json
 from tqdm import tqdm
+import argparse  # 导入argparse
 
 import config
 from model import TwoTowerModel
 
 def build_faiss_index(model, all_ideas):
-    """使用候选塔对所有idea进行编码并构建FAISS索引"""
+    """
+    使用候选塔对所有idea进行编码并构建FAISS索引 (内存优化版)。
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
-
-    # print("Encoding candidate ideas...")
-    candidate_embeddings = []
-    with torch.no_grad():
-        for i in tqdm(range(0, len(all_ideas), config.BATCH_SIZE), desc="Encoding ideas"):
-            batch_ideas = all_ideas[i:i+config.BATCH_SIZE]
-            embeddings = model.candidate_encoder(batch_ideas)
-            candidate_embeddings.append(embeddings.cpu().numpy())
-
-    # 明确将数据类型转换为 float32，这是FAISS所期望的
-    candidate_embeddings = np.vstack(candidate_embeddings).astype('float32')
     
-    # 检查一下是否有数据
-    if candidate_embeddings.shape[0] == 0:
-        print("Error: No candidate embeddings were generated.")
+    if not all_ideas:
+        print("Error: The list of candidate ideas is empty.")
         return
 
-    # 构建FAISS索引
-    index = faiss.IndexFlatIP(config.EMBEDDING_DIM)  # IP = Inner Product (点积)
-    # 归一化向量，使得点积等价于余弦相似度
-    faiss.normalize_L2(candidate_embeddings)
-    index.add(candidate_embeddings)
+    print(f"Building FAISS index for {len(all_ideas)} unique ideas...")
+    
+    index = faiss.IndexFlatIP(config.EMBEDDING_DIM)
+
+    with torch.no_grad():
+        for i in tqdm(range(0, len(all_ideas), config.BATCH_SIZE), desc="Encoding ideas and adding to index"):
+            batch_ideas = all_ideas[i:i+config.BATCH_SIZE]
+            embeddings = model.candidate_encoder(batch_ideas)
+            embeddings_np = embeddings.cpu().numpy().astype('float32')
+            faiss.normalize_L2(embeddings_np)
+            index.add(embeddings_np)
+
+    print(f"Index built successfully with {index.ntotal} vectors.")
+    
+    faiss.write_index(index, config.FAISS_INDEX_PATH)
+    with open(config.CANDIDATE_IDEAS_PATH, 'w', encoding='utf-8') as f:
+        json.dump(all_ideas, f, ensure_ascii=False, indent=4)
+        
+    print(f"FAISS index saved to {config.FAISS_INDEX_PATH}")
+    print(f"Candidate ideas saved to {config.CANDIDATE_IDEAS_PATH}")
 
 def search(query_text, top_k=5):
     """根据查询文本在FAISS索引中搜索最相似的idea"""
@@ -48,18 +54,22 @@ def search(query_text, top_k=5):
     model.to(device)
     model.eval()
     
-    index = faiss.read_index(config.FAISS_INDEX_PATH)
-    with open(config.CANDIDATE_IDEAS_PATH, 'r', encoding='utf-8') as f:
-        candidate_ideas = json.load(f)
+    # 确认文件存在
+    try:
+        index = faiss.read_index(config.FAISS_INDEX_PATH)
+        with open(config.CANDIDATE_IDEAS_PATH, 'r', encoding='utf-8') as f:
+            candidate_ideas = json.load(f)
+    except Exception as e:
+        print(f"Error loading index or candidate ideas: {e}")
+        print("Please run the script with '--mode build' first to create the index.")
+        return None
         
     # 编码查询
     with torch.no_grad():
-        query_embedding = model.query_encoder([query_text]).cpu().numpy()
+        query_embedding = model.query_encoder([query_text]).cpu().numpy().astype('float32')
     
-    # 归一化查询向量
     faiss.normalize_L2(query_embedding)
     
-    # 执行搜索
     distances, indices = index.search(query_embedding, top_k)
     
     results = []
@@ -73,28 +83,40 @@ def search(query_text, top_k=5):
     return results
 
 if __name__ == '__main__':
-    # --- 步骤1: 构建并保存FAISS索引 (通常离线执行一次) ---
-    print("Building FAISS index...")
-    full_df = pd.read_csv(config.DATA_FILE)
-    # 获取所有唯一的idea作为候选库
-    unique_ideas = full_df['idea'].dropna().unique().tolist()
+    # 创建一个解析器
+    parser = argparse.ArgumentParser(description="Build FAISS index or perform search.")
+    # 添加一个参数来决定运行模式，默认为 'search'
+    parser.add_argument('--mode', type=str, default='search', choices=['build', 'search'],
+                        help="Run mode: 'build' to create the index, 'search' to perform a query.")
+    
+    args = parser.parse_args()
 
-    # 加载训练好的模型
-    trained_model = TwoTowerModel()
-    trained_model.load_state_dict(torch.load(config.MODEL_SAVE_PATH))
-    print("Model loaded successfully.")
-
-    build_faiss_index(trained_model, unique_ideas)
-    
-    # --- 步骤2: 执行实时推荐 ---
-    print("\n--- Performing a search ---")
-    # 示例查询
-    sample_query = "一个包含大量用户评论和商家信息的数据集，常用于情感分析和推荐系统研究。"
-    
-    recommendations = search(sample_query, top_k=3)
-    
-    print(f"Query: \"{sample_query}\"")
-    print("\nTop 3 Recommended Ideas:")
-    for rec in recommendations:
-        print(f"  - Idea: {rec['idea'][:100]}...")
-        print(f"    Similarity: {rec['similarity']:.4f}")
+    # 根据模式执行不同的代码块
+    if args.mode == 'build':
+        print("--- Mode: Build Index ---")
+        # 加载训练好的模型
+        print("Loading trained model...")
+        model = TwoTowerModel()
+        model.load_state_dict(torch.load(config.MODEL_SAVE_PATH))
+        
+        # 加载全部数据以获取候选idea
+        print("Loading data to get unique ideas...")
+        full_df = pd.read_csv(config.DATA_FILE)
+        unique_ideas = full_df['idea'].dropna().unique().tolist()
+        
+        # 构建索引
+        build_faiss_index(model, unique_ideas)
+        
+    elif args.mode == 'search':
+        print("--- Mode: Search ---")
+        # 示例查询
+        sample_query = "一个包含大量用户评论和商家信息的数据集，常用于情感分析和推荐系统研究。"
+        
+        recommendations = search(sample_query, top_k=3)
+        
+        if recommendations:
+            print(f"Query: \"{sample_query}\"")
+            print("\nTop 3 Recommended Ideas:")
+            for rec in recommendations:
+                print(f"  - Idea: {rec['idea'][:100]}...")
+                print(f"    Similarity: {rec['similarity']:.4f}")
