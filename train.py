@@ -1,175 +1,184 @@
-# train.py
-
 import torch
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
+import argparse
+import faiss
 
 import config
 from data_loader import create_data_loaders
 from model import TwoTowerModel
-from loss import contrastive_loss
+from loss import contrastive_loss, triplet_loss
 
-def train_one_epoch(model, data_loader, optimizer, device):
-    """训练逻辑保持不变"""
-    model.train()
-    total_loss = 0
-    
-    for batch in tqdm(data_loader, desc="Training"):
-        optimizer.zero_grad()
-        
-        query_texts = list(batch['query'])
-        candidate_texts = list(batch['candidate'])
-        
-        query_embeddings, candidate_embeddings = model(query_texts, candidate_texts)
-        
-        loss = contrastive_loss(query_embeddings, candidate_embeddings, config.TEMPERATURE)
-        
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        
-    return total_loss / len(data_loader)
-
-def evaluate_retrieval(model, eval_loader, all_candidate_embeddings, all_candidates, device, top_k=[1, 5, 10]):
+def evaluate_retrieval(model, eval_loader, all_candidates, device, top_k_list=[1, 5, 10]):
     """
-    评估函数，执行全库检索。
+    优化版的评估函数，使用FAISS进行高效检索并采用向量化计算排名。
     
     Args:
         model: 待评估的模型
         eval_loader: 验证集或测试集的DataLoader
-        all_candidate_embeddings: 包含所有候选idea向量的Tensor
         all_candidates: 包含所有候选idea文本的列表
         device: 'cuda' or 'cpu'
-        top_k: 一个列表，例如 [1, 5, 10]，用于计算Recall@1, Recall@5, Recall@10
+        top_k_list: 一个列表，例如 [1, 5, 10]，用于计算Recall@K
     """
     model.eval()
     
-    # 将所有候选idea的文本映射到一个快速查找的字典中，key是idea文本，value是其在向量库中的索引
+    # ==================== 1. 一次性编码所有候选并构建FAISS索引 ====================
+    # 这部分是此函数的核心优化，避免在外部循环中重复编码。
+    all_candidate_embeddings = []
+    with torch.no_grad():
+        for i in tqdm(range(0, len(all_candidates), 256), desc="Encoding all candidates for eval"):
+            batch_ideas = all_candidates[i:i + 256]
+            embeddings = model.candidate_encoder(batch_ideas)
+            all_candidate_embeddings.append(embeddings.cpu().numpy().astype('float32'))
+            
+    all_candidate_embeddings = np.vstack(all_candidate_embeddings)
+    
+    # 构建FAISS索引
+    index = faiss.IndexFlatIP(model.query_encoder.dense_layers[-1].out_features)
+    faiss.normalize_L2(all_candidate_embeddings)
+    index.add(all_candidate_embeddings)
+
+    # ==================== 2. 准备地面实况 (Ground Truth) ====================
     candidate_map = {idea: i for i, idea in enumerate(all_candidates)}
     
-    total_hits = {k: 0 for k in top_k}
-    total_mrr = 0.0
-    total_samples = 0
+    all_ground_truth_indices = []
+    all_query_embeddings_list = []
 
+    print("Preparing ground truth and encoding queries...")
     with torch.no_grad():
-        for batch in tqdm(eval_loader, desc="Evaluating"):
-            query_texts = list(batch['query'])
+        for batch in eval_loader:
             ground_truth_ideas = list(batch['candidate'])
+            # 将文本形式的ground truth转换为在候选库中的索引
+            indices = [candidate_map.get(idea, -1) for idea in ground_truth_ideas]
+            all_ground_truth_indices.extend(indices)
             
-            # 1. 编码查询
-            query_embeddings = model.query_encoder(query_texts) # Shape: [batch_size, dim]
-            
-            # 2. 计算与所有候选向量的相似度
-            #    (query_embeddings @ all_candidate_embeddings.T) -> [batch_size, num_candidates]
-            similarity_scores = torch.matmul(query_embeddings, all_candidate_embeddings.T)
-            
-            # 3. 对每个查询的相似度进行排序，得到排名最高的候选索引
-            #    torch.topk返回 (values, indices)
-            _, top_k_indices = torch.topk(similarity_scores, max(top_k), dim=1) # Shape: [batch_size, max_top_k]
-            
-            top_k_indices = top_k_indices.cpu().numpy()
-
-            for i in range(len(query_texts)):
-                ground_truth_idea = ground_truth_ideas[i]
-                
-                # 获取真实idea在候选库中的索引
-                if ground_truth_idea not in candidate_map:
-                    continue # 如果验证集中的某个idea不在总候选库中，跳过
-                
-                ground_truth_idx = candidate_map[ground_truth_idea]
-                
-                # 查找真实idea的排名
-                # np.where返回一个元组，我们需要第一个数组
-                rank_list = np.where(top_k_indices[i] == ground_truth_idx)[0]
-                
-                if len(rank_list) > 0:
-                    rank = rank_list[0] + 1  # 排名从1开始
-                    total_mrr += 1.0 / rank
-                    for k in top_k:
-                        if rank <= k:
-                            total_hits[k] += 1
-            
-            total_samples += len(query_texts)
-
-    recall_at_k = {f"Recall@{k}": hits / total_samples for k, hits in total_hits.items()}
-    mrr = total_mrr / total_samples
+            # 同时编码查询
+            query_embeddings = model.query_encoder(list(batch['query']))
+            all_query_embeddings_list.append(query_embeddings.cpu().numpy().astype('float32'))
     
+    all_query_embeddings = np.vstack(all_query_embeddings_list)
+    faiss.normalize_L2(all_query_embeddings)
+    
+    # ==================== 3. 使用FAISS进行批量搜索 ====================
+    max_k = max(top_k_list)
+    print(f"Performing FAISS search for top {max_k} candidates...")
+    # D是距离（相似度），I是索引
+    _distances, top_k_indices = index.search(all_query_embeddings, max_k)
+    
+    # ==================== 4. 向量化计算排名和指标 ====================
+    # 将ground truth索引向量的形状从 (n,) 变为 (n, 1) 以便进行广播比较
+    ground_truth_vec = np.array(all_ground_truth_indices).reshape(-1, 1)
+    
+    # 创建一个布尔矩阵，表示每个召回的item是否是ground truth
+    # 结果形状为 [num_queries, max_k]
+    matches = (top_k_indices == ground_truth_vec)
+    
+    # 找到每个查询的第一个匹配项的排名（列索引）
+    # np.argmax在找到第一个True后就会停止，其索引即为排名-1
+    # 如果某一行全是False（即未命中），argmax会返回0，我们需要后续处理
+    ranks = np.argmax(matches, axis=1) + 1
+    
+    # 处理未命中的情况：如果一行中没有True，那么matches.any(axis=1)会是False
+    # 我们将这些未命中样本的排名设为0或一个大数，以便在计算MRR时不影响结果
+    not_found_mask = ~matches.any(axis=1)
+    ranks[not_found_mask] = 0
+    
+    # 计算MRR
+    reciprocal_ranks = np.where(ranks > 0, 1.0 / ranks, 0)
+    mrr = reciprocal_ranks.mean()
+    
+    # 计算Recall@K
+    total_samples = len(all_ground_truth_indices)
+    recall_at_k = {}
+    for k in top_k_list:
+        # 如果排名在1到k之间（包括k），则认为是在top-k内命中
+        hits = np.sum((ranks > 0) & (ranks <= k))
+        recall_at_k[f"Recall@{k}"] = hits / total_samples
+        
     return recall_at_k, mrr
 
+def train_one_epoch(model, data_loader, optimizer, device, mode):
+    model.train()
+    total_loss = 0
+    
+    for batch in tqdm(data_loader, desc=f"Training ({mode})"):
+        optimizer.zero_grad()
+        
+        if mode == 'round1':
+            query_texts = list(batch['query'])
+            candidate_texts = list(batch['candidate'])
+            query_embeddings, candidate_embeddings = model(query_texts, candidate_texts)
+            loss = contrastive_loss(query_embeddings, candidate_embeddings, config.TEMPERATURE)
+        else: # round2
+            query_texts = list(batch['query'])
+            positive_texts = list(batch['positive'])
+            negative_texts = list(batch['negative'])
+            q_emb, p_emb, n_emb = model(query_texts, positive_texts, negative_texts)
+            loss = triplet_loss(q_emb, p_emb, n_emb, config.TRIPLET_MARGIN)
+        
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        
+    return total_loss / len(data_loader)
+
 def main():
+    parser = argparse.ArgumentParser(description="Train a two-tower model in two stages.")
+    parser.add_argument('--mode', type=str, required=True, choices=['round1', 'round2'],
+                        help="Training stage: 'round1' for contrastive pre-training, 'round2' for triplet fine-tuning.")
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
-    # 1. 准备数据加载器和完整的候选库
-    train_loader, val_loader, test_loader, full_df = create_data_loaders(config.DATA_FILE)
-    
-    # 获取所有唯一的idea作为候选库
-    all_unique_ideas = full_df['idea'].dropna().unique().tolist()
-    print(f"Total unique candidate ideas: {len(all_unique_ideas)}")
-    
-    # 2. 初始化模型和优化器
+
     model = TwoTowerModel().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
-    
+    scheduler = CosineAnnealingLR(optimizer, T_max=config.EPOCHS, eta_min=1e-7)
+
+    if args.mode == 'round1':
+        print("--- Starting Training: Round 1 (Contrastive) ---")
+        train_loader, val_loader, _, full_df = create_data_loaders(config.DATA_FILE)
+        model_save_path = config.MODEL_SAVE_PATH_ROUND1
+    else: # round2
+        print("--- Starting Training: Round 2 (Triplet Fine-tuning) ---")
+        # 加载第一阶段的模型权重作为起点
+        print(f"Loading weights from {config.MODEL_SAVE_PATH_ROUND1}...")
+        try:
+            model.load_state_dict(torch.load(config.MODEL_SAVE_PATH_ROUND1))
+        except FileNotFoundError:
+            print("Error: Round 1 model not found. Please run '--mode round1' first.")
+            return
+
+        triplet_df = pd.read_csv(config.TRIPLET_DATA_PATH)
+        train_loader, val_loader, _, full_df = create_data_loaders(config.DATA_FILE, train_df_override=triplet_df)
+        model_save_path = config.MODEL_SAVE_PATH_FINAL
+
+    all_unique_ideas = full_df['idea'].dropna().unique().tolist()
     best_mrr = 0.0
-    
+
     for epoch in range(config.EPOCHS):
         print(f"\n--- Epoch {epoch+1}/{config.EPOCHS} ---")
-        
-        # 训练阶段保持不变
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}")
-        
-        # 验证阶段使用新的评估函数
-        print("Starting validation...")
-        # 首先，编码所有候选idea
-        model.eval()
-        with torch.no_grad():
-            candidate_embeddings_list = []
-            for i in tqdm(range(0, len(all_unique_ideas), config.BATCH_SIZE), desc="Encoding all candidates"):
-                batch_ideas = all_unique_ideas[i:i+config.BATCH_SIZE]
-                embeddings = model.candidate_encoder(batch_ideas)
-                candidate_embeddings_list.append(embeddings)
-            all_candidate_embeddings = torch.cat(candidate_embeddings_list, dim=0)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, args.mode)
+        scheduler.step() # 更新学习率
 
-        # 执行检索评估
-        recall_at_k, mrr = evaluate_retrieval(model, val_loader, all_candidate_embeddings, all_unique_ideas, device)
+        print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, LR = {optimizer.param_groups[0]['lr']:.8f}")
         
+        # 评估
+        recall_at_k, mrr = evaluate_retrieval(model, val_loader, all_unique_ideas, device)
         print(f"Validation MRR = {mrr:.4f}")
         for metric, value in recall_at_k.items():
             print(f"Validation {metric} = {value:.4f}")
-        
-        # 使用MRR作为模型选择的标准
+
         if mrr > best_mrr:
             best_mrr = mrr
-            torch.save(model.state_dict(), config.MODEL_SAVE_PATH)
-            print(f"New best model saved with MRR: {best_mrr:.4f} to {config.MODEL_SAVE_PATH}")
+            torch.save(model.state_dict(), model_save_path)
+            print(f"New best model saved with MRR: {best_mrr:.4f} to {model_save_path}")
 
-    # --- 最终测试 ---
-    print("\n--- Testing the best model on the test set ---")
-    # 加载最佳模型
-    model.load_state_dict(torch.load(config.MODEL_SAVE_PATH))
-    
-    # 再次为测试集编码所有候选idea（因为模型权重已更新）
-    model.eval()
-    with torch.no_grad():
-        candidate_embeddings_list = []
-        for i in tqdm(range(0, len(all_unique_ideas), config.BATCH_SIZE), desc="Encoding all candidates for test"):
-            batch_ideas = all_unique_ideas[i:i+config.BATCH_SIZE]
-            embeddings = model.candidate_encoder(batch_ideas)
-            candidate_embeddings_list.append(embeddings)
-        all_candidate_embeddings = torch.cat(candidate_embeddings_list, dim=0)
-    
-    # 在测试集上进行最终评估
-    recall_at_k, mrr = evaluate_retrieval(model, test_loader, all_candidate_embeddings, all_unique_ideas, device)
-    print("\nFinal Test Results:")
-    print(f"Test MRR = {mrr:.4f}")
-    for metric, value in recall_at_k.items():
-        print(f"Test {metric} = {value:.4f}")
-
+    print("\n--- Training Complete ---")
+    # 此处可以添加最终在test set上的测试逻辑
 
 if __name__ == '__main__':
     main()

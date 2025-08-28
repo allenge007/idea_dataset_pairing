@@ -50,7 +50,7 @@ def search(query_text, top_k=5):
     
     # 加载模型和索引
     model = TwoTowerModel()
-    model.load_state_dict(torch.load(config.MODEL_SAVE_PATH))
+    model.load_state_dict(torch.load(config.MODEL_SAVE_PATH_FINAL))
     model.to(device)
     model.eval()
     
@@ -97,7 +97,7 @@ if __name__ == '__main__':
         # 加载训练好的模型
         print("Loading trained model...")
         model = TwoTowerModel()
-        model.load_state_dict(torch.load(config.MODEL_SAVE_PATH))
+        model.load_state_dict(torch.load(config.MODEL_SAVE_PATH_FINAL))
         
         # 加载全部数据以获取候选idea
         print("Loading data to get unique ideas...")
@@ -110,7 +110,7 @@ if __name__ == '__main__':
     elif args.mode == 'search':
         print("--- Mode: Search ---")
         # 示例查询
-        sample_query = "一个包含大量用户评论和商家信息的数据集，常用于情感分析和推荐系统研究。"
+        sample_query = "一个包含大量人脸图像信息的数据集，用于人脸识别。"
         
         recommendations = search(sample_query, top_k=3)
         
@@ -118,5 +118,5 @@ if __name__ == '__main__':
             print(f"Query: \"{sample_query}\"")
             print("\nTop 3 Recommended Ideas:")
             for rec in recommendations:
-                print(f"  - Idea: {rec['idea'][:100]}...")
+                print(f"  - Idea: {rec['idea'][:]}...")
                 print(f"    Similarity: {rec['similarity']:.4f}")
