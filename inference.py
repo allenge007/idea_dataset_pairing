@@ -110,7 +110,7 @@ if __name__ == '__main__':
     elif args.mode == 'search':
         print("--- Mode: Search ---")
         # 示例查询
-        sample_query = "一个包含大量人脸图像信息的数据集，用于人脸识别。"
+        sample_query = "一个包含大量人脸图像信息的数据集。"
         
         recommendations = search(sample_query, top_k=3)
         
